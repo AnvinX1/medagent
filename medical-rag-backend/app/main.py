@@ -9,18 +9,72 @@ from langchain_core.tools import tool, render_text_description
 from langchain_postgres import PostgresChatMessageHistory
 from typing import Optional, List
 import glob
+import psycopg
+from datetime import datetime
 
-app = FastAPI(title="Medical AI Backend")
-
-DB_PATH = "db"
-DATA_PATH = "data"
+# --- Configuration ---
+DB_PATH = "../db"
+DATA_PATH = "../data"
 MODEL_NAME = os.getenv("MODEL_NAME", "llama3")
 DATABASE_URL = os.getenv("DATABASE_URL")
+
+# --- Database Setup ---
+def get_db_connection():
+    if not DATABASE_URL:
+        raise ValueError("DATABASE_URL is not set.")
+    return psycopg.connect(DATABASE_URL)
+
+def init_db():
+    if not DATABASE_URL:
+        print("Warning: DATABASE_URL not set, skipping DB init.")
+        return
+    try:
+        with get_db_connection() as conn:
+            with conn.cursor() as cur:
+                # Health Metrics Table
+                cur.execute("""
+                    CREATE TABLE IF NOT EXISTS health_metrics (
+                        id SERIAL PRIMARY KEY,
+                        patient_id TEXT DEFAULT 'default_user',
+                        metric_type TEXT NOT NULL,
+                        value REAL NOT NULL,
+                        unit TEXT,
+                        timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                    );
+                """)
+                # Appointments Table
+                cur.execute("""
+                    CREATE TABLE IF NOT EXISTS appointments (
+                        id SERIAL PRIMARY KEY,
+                        patient_name TEXT NOT NULL,
+                        appointment_time TEXT NOT NULL,
+                        status TEXT DEFAULT 'scheduled',
+                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                    );
+                """)
+                conn.commit()
+        print("Database initialized successfully.")
+    except Exception as e:
+        print(f"Error initializing database: {e}")
+
+# Initialize DB on startup
+init_db()
+
+app = FastAPI(title="Medical AI Backend")
 
 class QueryRequest(BaseModel):
     query: str
     session_id: Optional[str] = "default_session"
     doc_filters: Optional[List[str]] = None
+
+class HealthMetric(BaseModel):
+    metric_type: str
+    value: float
+    unit: str
+
+class AppointmentRequest(BaseModel):
+    patient_name: str
+    appointment_time: str
 
 def get_chat_history(session_id: str):
     if not DATABASE_URL:
@@ -91,7 +145,11 @@ def create_search_tool(doc_filters: Optional[List[str]]):
         if doc_filters:
             filters = []
             for doc in doc_filters:
-                filters.append({"source": os.path.join(DATA_PATH, doc)})
+                # The DB stores paths relative to the ingestion root (e.g., "data\file.pdf")
+                # We need to match that exactly.
+                # Since we are on Windows, we should likely use os.path.join("data", doc)
+                # But to be safe and match the DB inspection result:
+                filters.append({"source": os.path.join("data", doc)})
             
             if len(filters) == 1:
                 search_kwargs["filter"] = filters[0]
@@ -129,9 +187,26 @@ def check_drug_interactions(drug_list: str) -> str:
 def schedule_appointment(patient_name: str) -> str:
     """
     Schedule a medical appointment.
-    Input should be the patient name and time.
+    Input should be the patient name and time (e.g., "John Doe at 5pm").
     """
-    return f"Appointment confirmed for {patient_name}."
+    try:
+        # Simple parsing logic (in a real app, use an LLM or robust parser)
+        parts = patient_name.split(" at ")
+        if len(parts) == 2:
+            name, time = parts[0], parts[1]
+        else:
+            name, time = patient_name, "Unspecified Time"
+
+        with get_db_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "INSERT INTO appointments (patient_name, appointment_time) VALUES (%s, %s)",
+                    (name, time)
+                )
+                conn.commit()
+        return f"Appointment confirmed for {name} at {time}."
+    except Exception as e:
+        return f"Failed to schedule appointment: {e}"
 
 # --- API Endpoints ---
 
@@ -144,11 +219,71 @@ def list_documents():
     filenames = [os.path.basename(f) for f in files]
     return {"documents": filenames}
 
+@app.get("/health-metrics")
+def get_health_metrics():
+    try:
+        with get_db_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT metric_type, value, unit, timestamp FROM health_metrics ORDER BY timestamp DESC")
+                rows = cur.fetchall()
+                metrics = [{"metric": r[0], "value": r[1], "unit": r[2], "date": r[3]} for r in rows]
+        return {"metrics": metrics}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/health-metrics")
+def add_health_metric(metric: HealthMetric):
+    try:
+        with get_db_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "INSERT INTO health_metrics (metric_type, value, unit) VALUES (%s, %s, %s)",
+                    (metric.metric_type, metric.value, metric.unit)
+                )
+                conn.commit()
+        return {"status": "success"}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/appointments")
+def get_appointments():
+    try:
+        with get_db_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT patient_name, appointment_time, status, created_at FROM appointments ORDER BY created_at DESC")
+                rows = cur.fetchall()
+                appointments = [{"patient": r[0], "time": r[1], "status": r[2], "created": r[3]} for r in rows]
+        return {"appointments": appointments}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/usage-stats")
+def get_usage_stats():
+    try:
+        # Simple usage stats from chat_history table (created by LangChain)
+        with get_db_connection() as conn:
+            with conn.cursor() as cur:
+                # Check if table exists first
+                cur.execute("SELECT to_regclass('public.chat_history');")
+                if not cur.fetchone()[0]:
+                    return {"total_messages": 0, "unique_sessions": 0}
+                
+                cur.execute("SELECT COUNT(*) FROM chat_history")
+                total_messages = cur.fetchone()[0]
+                
+                cur.execute("SELECT COUNT(DISTINCT session_id) FROM chat_history")
+                unique_sessions = cur.fetchone()[0]
+                
+        return {"total_messages": total_messages, "unique_sessions": unique_sessions}
+    except Exception as e:
+        # Table might not exist yet if no chats happened
+        return {"total_messages": 0, "unique_sessions": 0, "error": str(e)}
+
 @app.post("/chat")
 async def chat(request: QueryRequest):
     # Initialize LLM
     # ReAct works best with a bit of temperature to be creative with thoughts, but 0 is safer for formatting.
-    llm = ChatOllama(model=MODEL_NAME, temperature=0, stop=["Observation:"])
+    llm = ChatOllama(model=MODEL_NAME, temperature=0)
     
     # Create the search tool with current filters
     search_tool_instance = create_search_tool(request.doc_filters)
@@ -176,7 +311,11 @@ async def chat(request: QueryRequest):
     IMPORTANT: 
     - Always start your response with "Thought:".
     - Do not output "Observation:" yourself.
-    - If you have the answer, use "Final Answer:".
+    - If you have the answer or do not need to use a tool, you MUST use the format:
+      Thought: I have the answer.
+      Final Answer: [your response here]
+    - Do NOT use "Action: None" or "Action: N/A". If no tool is needed, go straight to Final Answer.
+    - When using 'search_tool', your Action Input must be a specific search query (e.g., "patient diagnosis", "blood test results", "medical history summary"). Do NOT use generic terms like "the pdf" or "uploaded file".
 
     Begin!
 
