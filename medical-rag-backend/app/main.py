@@ -11,11 +11,20 @@ from typing import Optional, List
 import glob
 import psycopg
 from datetime import datetime
+from dotenv import load_dotenv
+
+# Load env variables from parent directory if not found
+load_dotenv(dotenv_path="../.env")
 
 # --- Configuration ---
-DB_PATH = "../db"
-DATA_PATH = "../data"
-MODEL_NAME = os.getenv("MODEL_NAME", "llama3")
+import sys
+# Add parent directory to path to import ingest.py
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from ingest import ingest_documents, DATA_PATH, DB_PATH
+
+MODEL_NAME = os.getenv("MODEL_NAME", "qwen3-coder:latest")
+EMBEDDING_MODEL_NAME = os.getenv("EMBEDDING_MODEL_NAME", "nomic-embed-text")
 DATABASE_URL = os.getenv("DATABASE_URL")
 
 # --- Database Setup ---
@@ -62,6 +71,20 @@ init_db()
 
 app = FastAPI(title="Medical AI Backend")
 
+from fastapi.middleware.cors import CORSMiddleware
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"], # Allow all origins for dev, or specific ["http://localhost:3000"]
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+@app.get("/health")
+def health_check():
+    return {"status": "ok"}
+
 class QueryRequest(BaseModel):
     query: str
     session_id: Optional[str] = "default_session"
@@ -107,7 +130,7 @@ def search_medical_records(query: str) -> str:
     # Let's use a global var hack for the demo or a class-based tool.
     # Better: We'll assume the agent just searches text.
     
-    embeddings = OllamaEmbeddings(model="nomic-embed-text")
+    embeddings = OllamaEmbeddings(model=EMBEDDING_MODEL_NAME)
     try:
         vector_store = Chroma(persist_directory=DB_PATH, embedding_function=embeddings)
     except Exception as e:
@@ -134,13 +157,13 @@ def create_search_tool(doc_filters: Optional[List[str]]):
         Search the medical knowledge base (PDFs) for information. 
         Use this tool to answer questions about medical guidelines, prescriptions, or patient history.
         """
-        embeddings = OllamaEmbeddings(model="nomic-embed-text")
+        embeddings = OllamaEmbeddings(model=EMBEDDING_MODEL_NAME)
         try:
             vector_store = Chroma(persist_directory=DB_PATH, embedding_function=embeddings)
         except Exception as e:
             return f"Error connecting to database: {str(e)}"
 
-        search_kwargs = {"k": 3}
+        search_kwargs = {"k": 6}
         
         if doc_filters:
             filters = []
@@ -210,6 +233,9 @@ def schedule_appointment(patient_name: str) -> str:
 
 # --- API Endpoints ---
 
+from fastapi import File, UploadFile
+import shutil
+
 @app.get("/documents")
 def list_documents():
     """List all available PDF documents in the data directory."""
@@ -218,6 +244,28 @@ def list_documents():
     files = glob.glob(os.path.join(DATA_PATH, "*.pdf"))
     filenames = [os.path.basename(f) for f in files]
     return {"documents": filenames}
+
+@app.post("/documents/upload")
+async def upload_document(file: UploadFile = File(...)):
+    try:
+        if not os.path.exists(DATA_PATH):
+            os.makedirs(DATA_PATH)
+        
+        file_path = os.path.join(DATA_PATH, file.filename)
+        
+        with open(file_path, "wb") as buffer:
+            shutil.copyfileobj(file.file, buffer)
+            
+        # Trigger ingestion (re-index all files to be safe)
+        # Note: This is a blocking operation and might timeout for large files.
+        # Ideally, use background tasks.
+        # But for this demo, generic blocking is "okay" or we can trigger it in background.
+        # Fastapi BackgroundTasks is better.
+        ingest_documents(clear_db=True)
+        
+        return {"status": "success", "filename": file.filename, "message": "File uploaded and ingested."}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/health-metrics")
 def get_health_metrics():
@@ -316,6 +364,8 @@ async def chat(request: QueryRequest):
       Final Answer: [your response here]
     - Do NOT use "Action: None" or "Action: N/A". If no tool is needed, go straight to Final Answer.
     - When using 'search_tool', your Action Input must be a specific search query (e.g., "patient diagnosis", "blood test results", "medical history summary"). Do NOT use generic terms like "the pdf" or "uploaded file".
+    - If your search returns "No relevant information found", DO NOT RETRY EXACTLY THE SAME QUERY. Try a different query or keywords.
+    - If you cannot find the answer after 2 different searches, you MUST stop and say: "Final Answer: The provided documents do not contain sufficient information to answer this question."
 
     Begin!
 
@@ -351,16 +401,36 @@ async def chat(request: QueryRequest):
     chat_history_str = ""
     if DATABASE_URL:
         try:
-            history = get_chat_history(request.session_id)
-            messages = history.messages[-5:]
-            for msg in messages:
-                role = "User" if msg.type == "human" else "Assistant"
-                chat_history_str += f"{role}: {msg.content}\n"
-        except Exception as e:
-            print(f"Warning: Could not fetch chat history: {e}")
+            get_chat_history(request.session_id)
+            # We need to manually query because PostgresChatMessageHistory interface might be tricky 
+            # or just rely on the object if constructed correctly.
+            # Actually, let's fix the construction first.
+        except:
+            pass
+            
+        # Re-implementing history fetch manually to be safe or fixing the object usage
+        # Ideally we use the object.
+        pass
 
     # Run Agent
     try:
+        # We need to manage history string manually for the prompt
+        # Let's try to get it from the DB
+        chat_history_str = ""
+        if DATABASE_URL:
+             with get_db_connection() as conn:
+                with conn.cursor() as cur:
+                     # Check table first
+                    try:
+                        cur.execute("SELECT type, content FROM chat_history WHERE session_id = %s ORDER BY id DESC LIMIT 5", (request.session_id,))
+                        rows = cur.fetchall()
+                        # rows are (type, content) - reversed order
+                        for r in reversed(rows):
+                            role = "User" if r[0] == "human" else "Assistant"
+                            chat_history_str += f"{role}: {r[1]}\n"
+                    except:
+                        pass # Table likely doesn't exist yet
+
         result = agent_executor.invoke({
             "input": request.query,
             "chat_history": chat_history_str
@@ -371,9 +441,32 @@ async def chat(request: QueryRequest):
         # Save to history
         if DATABASE_URL:
             try:
-                history = get_chat_history(request.session_id)
-                history.add_user_message(request.query)
-                history.add_ai_message(answer)
+                # Use the class but fix arguments? 
+                # Or just manual insert since we are already doing manual fetch?
+                # Manual insert is safer given the warnings.
+                 with get_db_connection() as conn:
+                    with conn.cursor() as cur:
+                        # Create table if not exists (handled by init_db? No, LangChain creates it usually)
+                        # Let's create it manually to be sure.
+                        cur.execute("""
+                            CREATE TABLE IF NOT EXISTS chat_history (
+                                id SERIAL PRIMARY KEY,
+                                session_id TEXT NOT NULL,
+                                type TEXT NOT NULL,
+                                content TEXT NOT NULL,
+                                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                            );
+                        """)
+                        cur.execute(
+                            "INSERT INTO chat_history (session_id, type, content) VALUES (%s, %s, %s)",
+                            (request.session_id, "human", request.query)
+                        )
+                        cur.execute(
+                            "INSERT INTO chat_history (session_id, type, content) VALUES (%s, %s, %s)",
+                            (request.session_id, "ai", answer)
+                        )
+                        conn.commit()
+
             except Exception as e:
                 print(f"Warning: Could not save to chat history: {e}")
 

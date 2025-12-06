@@ -4,6 +4,9 @@ import os
 import shutil
 import uuid
 import pandas as pd
+from dotenv import load_dotenv
+
+load_dotenv()
 
 # Configuration
 API_URL = "http://localhost:8000"
@@ -48,14 +51,19 @@ def render_chat_page():
                 
                 st.success(f"Saved {saved_count} files.")
                 
-                with st.spinner("Ingesting documents..."):
-                    try:
-                        from ingest import ingest_documents
-                        ingest_documents()
-                        st.success("Ingestion complete!")
-                        st.rerun() 
-                    except Exception as e:
-                        st.error(f"Ingestion failed: {str(e)}")
+                progress_bar = st.progress(0, text="Starting ingestion...")
+                
+                def update_progress(current, total):
+                    progress = float(current) / float(total)
+                    progress_bar.progress(progress, text=f"Processed {current}/{total} chunks")
+
+                try:
+                    from ingest import ingest_documents
+                    ingest_documents(status_callback=update_progress)
+                    st.success("Ingestion complete!")
+                    st.rerun() 
+                except Exception as e:
+                    st.error(f"Ingestion failed: {str(e)}")
             else:
                 st.warning("Please upload files first.")
 

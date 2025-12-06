@@ -13,19 +13,33 @@ def inspect_db():
     embeddings = OllamaEmbeddings(model="nomic-embed-text")
     try:
         vector_store = Chroma(persist_directory=DB_PATH, embedding_function=embeddings)
+        print("Vector store initialized.")
+        
         # Get all documents (limit to 5 to avoid spam)
         results = vector_store.get(limit=5)
         
         if not results['ids']:
-            print("Database is empty.")
-            return
+            print("Database appears empty (no IDs found).")
+        else:
+            print(f"Found {len(results['ids'])} documents (showing first 5).")
+            for i, meta in enumerate(results['metadatas']):
+                print(f"Doc {i}: Source = {meta.get('source')}")
 
-        print(f"Found {len(results['ids'])} documents (showing first 5).")
-        for i, meta in enumerate(results['metadatas']):
-            print(f"Doc {i}: Source = {meta.get('source')}")
+        # Test Query
+        print("\n--- Testing Search for 'Polycystic' ---")
+        query = "Polycystic"
+        results = vector_store.similarity_search(query, k=5)
+        if not results:
+             print("Search returned NO results.")
+        for i, doc in enumerate(results):
+            print(f"\nResult {i+1}:")
+            print(f"Source: {doc.metadata.get('source')}")
+            print(f"Content: {doc.page_content[:200].replace(chr(10), ' ')}...") # Show snippet
             
     except Exception as e:
-        print(f"Error reading database: {e}")
+        print(f"Error acting on database: {e}")
+        import traceback
+        traceback.print_exc()
 
 if __name__ == "__main__":
     inspect_db()
